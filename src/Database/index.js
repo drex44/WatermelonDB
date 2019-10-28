@@ -7,11 +7,10 @@ import { values } from 'rambdax'
 
 import { invariant } from '../utils/common'
 
-import { CollectionChangeTypes } from '../Collection/common'
-
 import type { DatabaseAdapter, BatchOperation } from '../adapters/type'
 import type Model from '../Model'
-import type Collection, { CollectionChangeSet } from '../Collection'
+import { type CollectionChangeSet } from '../Collection'
+import { CollectionChangeTypes } from '../Collection/common'
 import type { TableName, AppSchema } from '../Schema'
 
 import CollectionMap from './CollectionMap'
@@ -20,7 +19,7 @@ import ActionQueue, { type ActionInterface } from './ActionQueue'
 type DatabaseProps = $Exact<{
   adapter: DatabaseAdapter,
   modelClasses: Array<Class<Model>>,
-  actionsEnabled?: boolean,
+  actionsEnabled: boolean,
 }>
 
 export default class Database {
@@ -32,13 +31,24 @@ export default class Database {
 
   _actionQueue = new ActionQueue()
 
-  #actionsEnabled: boolean
+  _actionsEnabled: boolean
 
-  constructor({ adapter, modelClasses, actionsEnabled = false }: DatabaseProps): void {
+  constructor({ adapter, modelClasses, actionsEnabled }: DatabaseProps): void {
+    if (process.env.NODE_ENV !== 'production') {
+      invariant(adapter, `Missing adapter parameter for new Database()`)
+      invariant(
+        modelClasses && Array.isArray(modelClasses),
+        `Missing modelClasses parameter for new Database()`,
+      )
+      invariant(
+        actionsEnabled === true || actionsEnabled === false,
+        'You must pass `actionsEnabled:` key to Database constructor. It is highly recommended you pass `actionsEnabled: true` (see documentation for more details), but can pass `actionsEnabled: false` for backwards compatibility.',
+      )
+    }
     this.adapter = adapter
     this.schema = adapter.schema
     this.collections = new CollectionMap(this, modelClasses)
-    this.#actionsEnabled = actionsEnabled
+    this._actionsEnabled = actionsEnabled
   }
 
   // Executes multiple prepared operations
@@ -49,43 +59,53 @@ export default class Database {
       `Database.batch() can only be called from inside of an Action. See docs for more details.`,
     )
 
-    const operations: BatchOperation[] = records.reduce((ops, record) => {
+    // performance critical - using mutations
+    const batchOperations: BatchOperation[] = []
+    const changeNotifications: { [collectionName: TableName<any>]: CollectionChangeSet<*> } = {}
+    records.forEach(record => {
       if (!record) {
-        return ops
+        return
       }
 
       invariant(
-        !record._isCommitted || record._hasPendingUpdate,
+        !record._isCommitted || record._hasPendingUpdate || record._hasPendingDelete,
         `Cannot batch a record that doesn't have a prepared create or prepared update`,
       )
 
-      if (record._hasPendingUpdate) {
+      const raw = record._raw
+      const { id } = raw // faster than Model.id
+      const { table } = record.constructor // faster than Model.table
+
+      let changeType
+
+      // Deletes take presedence over updates
+      if (record._hasPendingDelete) {
+        if (record._hasPendingDelete === 'destroy') {
+          batchOperations.push(['destroyPermanently', table, id])
+        } else {
+          batchOperations.push(['markAsDeleted', table, id])
+        }
+        changeType = CollectionChangeTypes.destroyed
+      } else if (record._hasPendingUpdate) {
         record._hasPendingUpdate = false // TODO: What if this fails?
-        return ops.concat([['update', record]])
-      }
-
-      return ops.concat([['create', record]])
-    }, [])
-    await this.adapter.batch(operations)
-
-    const sortedOperations: { collection: Collection<*>, operations: CollectionChangeSet<*> }[] = []
-    operations.forEach(([type, record]) => {
-      const operation = {
-        record,
-        type: type === 'create' ? CollectionChangeTypes.created : CollectionChangeTypes.updated,
-      }
-      const indexOfCollection = sortedOperations.findIndex(
-        ({ collection }) => collection === record.collection,
-      )
-      if (indexOfCollection !== -1) {
-        sortedOperations[indexOfCollection].operations.push(operation)
+        batchOperations.push(['update', table, raw])
+        changeType = CollectionChangeTypes.updated
       } else {
-        const { collection } = record
-        sortedOperations.push({ collection, operations: [operation] })
+        batchOperations.push(['create', table, raw])
+        changeType = CollectionChangeTypes.created
       }
+
+      if (!changeNotifications[table]) {
+        changeNotifications[table] = []
+      }
+      changeNotifications[table].push({ record, type: changeType })
     })
-    sortedOperations.forEach(({ collection, operations: operationz }) => {
-      collection.changeSet(operationz)
+
+    await this.adapter.batch(batchOperations)
+
+    Object.entries(changeNotifications).forEach(notification => {
+      const [table, changeSet]: [TableName<any>, CollectionChangeSet<any>] = (notification: any)
+      this.collections.get(table).changeSet(changeSet)
     })
   }
 
@@ -135,13 +155,6 @@ export default class Database {
   }
 
   _ensureInAction(error: string): void {
-    this.#actionsEnabled && invariant(this._actionQueue.isRunning, error)
-  }
-
-  _ensureActionsEnabled(): void {
-    invariant(
-      this.#actionsEnabled,
-      '[Sync] To use Sync, Actions must be enabled. Pass `{ actionsEnabled: true }` to Database constructor — see docs for more details',
-    )
+    this._actionsEnabled && invariant(this._actionQueue.isRunning, error)
   }
 }

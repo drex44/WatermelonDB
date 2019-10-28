@@ -2,16 +2,10 @@
 /* eslint-disable global-require */
 
 import { NativeModules } from 'react-native'
-import {
-  connectionTag,
-  type ConnectionTag,
-  logger,
-  isDevelopment,
-  invariant,
-} from '../../utils/common'
+import { connectionTag, type ConnectionTag, logger, invariant } from '../../utils/common'
 
-import type Model, { RecordId } from '../../Model'
-import type Query from '../../Query'
+import type { RecordId } from '../../Model'
+import type { SerializedQuery } from '../../Query'
 import type { TableName, AppSchema, SchemaVersion } from '../../Schema'
 import type { SchemaMigrations, MigrationStep } from '../../Schema/migrations'
 import type { DatabaseAdapter, CachedQueryResult, CachedFindResult, BatchOperation } from '../type'
@@ -56,6 +50,7 @@ type NativeBridgeType = {
   query: (ConnectionTag, TableName<any>, SQL) => Promise<DirtyQueryResult>,
   count: (ConnectionTag, SQL) => Promise<number>,
   batch: (ConnectionTag, NativeBridgeBatchOperation[]) => Promise<void>,
+  batchJSON?: (ConnectionTag, string) => Promise<void>,
   getDeletedRecords: (ConnectionTag, TableName<any>) => Promise<RecordId[]>,
   destroyDeletedRecords: (ConnectionTag, TableName<any>, RecordId[]) => Promise<void>,
   unsafeResetDatabase: (ConnectionTag, SQL, SchemaVersion) => Promise<void>,
@@ -68,7 +63,7 @@ const Native: NativeBridgeType = NativeModules.DatabaseBridge
 export type SQLiteAdapterOptions = $Exact<{
   dbName?: string,
   schema: AppSchema,
-  migrationsExperimental?: SchemaMigrations,
+  migrations?: SchemaMigrations,
 }>
 
 export default class SQLiteAdapter implements DatabaseAdapter {
@@ -80,11 +75,24 @@ export default class SQLiteAdapter implements DatabaseAdapter {
 
   _dbName: string
 
-  constructor({ dbName, schema, migrationsExperimental }: SQLiteAdapterOptions): void {
+  constructor(options: SQLiteAdapterOptions): void {
+    const { dbName, schema, migrations } = options
     this.schema = schema
-    this.migrations = migrationsExperimental
+    this.migrations = migrations
     this._dbName = this._getName(dbName)
-    isDevelopment && validateAdapter(this)
+
+    if (process.env.NODE_ENV !== 'production') {
+      invariant(
+        // $FlowFixMe
+        options.migrationsExperimental === undefined,
+        'SQLiteAdapter migrationsExperimental has been renamed to migrations',
+      )
+      invariant(
+        Native,
+        `NativeModules.DatabaseBridge is not defined! This means that you haven't properly linked WatermelonDB native module. Refer to docs for more details`,
+      )
+      validateAdapter(this)
+    }
 
     devLogSetUp(() => this._init())
   }
@@ -93,7 +101,7 @@ export default class SQLiteAdapter implements DatabaseAdapter {
     return new SQLiteAdapter({
       dbName: this._dbName,
       schema: this.schema,
-      ...(this.migrations ? { migrationsExperimental: this.migrations } : {}),
+      ...(this.migrations ? { migrations: this.migrations } : {}),
       ...options,
     })
   }
@@ -163,7 +171,7 @@ export default class SQLiteAdapter implements DatabaseAdapter {
     logger.log(`[DB] Schema set up successfully`)
   }
 
-  async find(table: TableName<any>, id: RecordId): Promise<CachedFindResult> {
+  find(table: TableName<any>, id: RecordId): Promise<CachedFindResult> {
     return devLogFind(
       async () =>
         sanitizeFindResult(await Native.find(this._tag, table, id), this.schema.tables[table]),
@@ -172,7 +180,7 @@ export default class SQLiteAdapter implements DatabaseAdapter {
     )
   }
 
-  async query<T: Model>(query: Query<T>): Promise<CachedQueryResult> {
+  query(query: SerializedQuery): Promise<CachedQueryResult> {
     return devLogQuery(
       async () =>
         sanitizeQueryResult(
@@ -183,28 +191,37 @@ export default class SQLiteAdapter implements DatabaseAdapter {
     )
   }
 
-  async count<T: Model>(query: Query<T>): Promise<number> {
+  count(query: SerializedQuery): Promise<number> {
     return devLogCount(() => Native.count(this._tag, encodeQuery(query, true)), query)
   }
 
-  async batch(operations: BatchOperation[]): Promise<void> {
-    await devLogBatch(async () => {
-      await Native.batch(
-        this._tag,
-        operations.map(([type, record]) => {
-          switch (type) {
-            case 'create':
-              return ['create', record.table, record.id, ...encodeInsert(record)]
-            case 'markAsDeleted':
-              return ['markAsDeleted', record.table, record.id]
-            case 'destroyPermanently':
-              return ['destroyPermanently', record.table, record.id]
-            default:
-              // case 'update':
-              return ['execute', record.table, ...encodeUpdate(record)]
+  batch(operations: BatchOperation[]): Promise<void> {
+    return devLogBatch(async () => {
+      const batchOperations: NativeBridgeBatchOperation[] = operations.map(operation => {
+        const [type, table, rawOrId] = operation
+        switch (type) {
+          case 'create': {
+            // $FlowFixMe
+            return ['create', table, rawOrId.id].concat(encodeInsert(table, rawOrId))
           }
-        }),
-      )
+          case 'update': {
+            // $FlowFixMe
+            return ['execute', table].concat(encodeUpdate(table, rawOrId))
+          }
+          case 'markAsDeleted':
+          case 'destroyPermanently':
+            // $FlowFixMe
+            return operation // same format, no need to repack
+          default:
+            throw new Error('unknown batch operation type')
+        }
+      })
+      const { batchJSON } = Native
+      if (batchJSON) {
+        await batchJSON(this._tag, JSON.stringify(batchOperations))
+      } else {
+        await Native.batch(this._tag, batchOperations)
+      }
     }, operations)
   }
 

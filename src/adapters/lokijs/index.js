@@ -1,13 +1,12 @@
 // @flow
 
 import type { LokiMemoryAdapter } from 'lokijs'
-import { map } from 'rambdax'
-import { isDevelopment } from '../../utils/common'
+import { invariant } from '../../utils/common'
 
-import type Model, { RecordId } from '../../Model'
+import type { RecordId } from '../../Model'
 import type { TableName, AppSchema } from '../../Schema'
 import type { SchemaMigrations } from '../../Schema/migrations'
-import type Query from '../../Query'
+import type { SerializedQuery } from '../../Query'
 import type { DatabaseAdapter, CachedQueryResult, CachedFindResult, BatchOperation } from '../type'
 import {
   devLogFind,
@@ -35,15 +34,20 @@ const {
   DESTROY_DELETED_RECORDS,
 } = actions
 
-type LokiAdapterOptions = $Exact<{
+export type LokiAdapterOptions = $Exact<{
   dbName?: ?string,
   schema: AppSchema,
-  migrationsExperimental?: SchemaMigrations,
+  migrations?: SchemaMigrations,
+  // (true by default) Although web workers may have some throughput benefits, disabling them
+  // may lead to lower memory consumption, lower latency, and easier debugging
+  useWebWorker?: boolean,
+  experimentalUseIncrementalIndexedDB?: boolean,
+  // -- internal --
   _testLokiAdapter?: LokiMemoryAdapter,
 }>
 
 export default class LokiJSAdapter implements DatabaseAdapter {
-  workerBridge: WorkerBridge = new WorkerBridge()
+  workerBridge: WorkerBridge
 
   schema: AppSchema
 
@@ -52,11 +56,23 @@ export default class LokiJSAdapter implements DatabaseAdapter {
   _dbName: ?string
 
   constructor(options: LokiAdapterOptions): void {
-    const { schema, migrationsExperimental: migrations, dbName } = options
+    const { schema, migrations, dbName } = options
+
+    const useWebWorker = options.useWebWorker ?? process.env.NODE_ENV !== 'test'
+    this.workerBridge = new WorkerBridge(useWebWorker)
+
     this.schema = schema
     this.migrations = migrations
     this._dbName = dbName
-    isDevelopment && validateAdapter(this)
+
+    if (process.env.NODE_ENV !== 'production') {
+      invariant(
+        // $FlowFixMe
+        options.migrationsExperimental === undefined,
+        'LokiJSAdapter migrationsExperimental has been renamed to migrations',
+      )
+      validateAdapter(this)
+    }
 
     devLogSetUp(() => this.workerBridge.send(SETUP, [options]))
   }
@@ -73,30 +89,51 @@ export default class LokiJSAdapter implements DatabaseAdapter {
     return new LokiJSAdapter({
       dbName: this._dbName,
       schema: this.schema,
-      ...(this.migrations ? { migrationsExperimental: this.migrations } : {}),
+      ...(this.migrations ? { migrations: this.migrations } : {}),
       _testLokiAdapter: lokiAdapter,
       ...options,
     })
   }
 
-  async find(table: TableName<any>, id: RecordId): Promise<CachedFindResult> {
+  find(table: TableName<any>, id: RecordId): Promise<CachedFindResult> {
     return devLogFind(() => this.workerBridge.send(FIND, [table, id]), table, id)
   }
 
-  async query<T: Model>(query: Query<T>): Promise<CachedQueryResult> {
-    return devLogQuery(() => this.workerBridge.send(QUERY, [query.serialize()]), query)
-  }
-
-  async count<T: Model>(query: Query<T>): Promise<number> {
-    return devLogCount(() => this.workerBridge.send(COUNT, [query.serialize()]), query)
-  }
-
-  async batch(operations: BatchOperation[]): Promise<void> {
-    await devLogBatch(
+  query(query: SerializedQuery): Promise<CachedQueryResult> {
+    return devLogQuery(
       () =>
-        this.workerBridge.send(BATCH, [
-          map(([type, record]) => [type, record.table, record._raw], operations),
-        ]),
+        this.workerBridge.send(
+          QUERY,
+          [query],
+          // SerializedQueries are immutable, so we need no copy
+          'immutable',
+        ),
+      query,
+    )
+  }
+
+  count(query: SerializedQuery): Promise<number> {
+    return devLogCount(
+      () =>
+        this.workerBridge.send(
+          COUNT,
+          [query],
+          // SerializedQueries are immutable, so we need no copy
+          'immutable',
+        ),
+      query,
+    )
+  }
+
+  batch(operations: BatchOperation[]): Promise<void> {
+    return devLogBatch(
+      () =>
+        this.workerBridge.send(
+          BATCH,
+          [operations],
+          // batches are only strings + raws which only have JSON-compatible values, rest is immutable
+          'shallowCloneDeepObjects',
+        ),
       operations,
     )
   }

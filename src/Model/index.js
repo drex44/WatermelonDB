@@ -2,25 +2,21 @@
 
 import type { Observable } from 'rxjs'
 import { BehaviorSubject } from 'rxjs/BehaviorSubject'
-import isDevelopment from '../utils/common/isDevelopment'
 import invariant from '../utils/common/invariant'
 import ensureSync from '../utils/common/ensureSync'
 import fromPairs from '../utils/fp/fromPairs'
 import noop from '../utils/fp/noop'
 import type { $RE } from '../types'
 
-import field from '../decorators/field'
-import readonly from '../decorators/readonly'
-
 import type Database from '../Database'
 import type Collection from '../Collection'
 import type CollectionMap from '../Database/CollectionMap'
 import { type TableName, type ColumnName, columnName } from '../Schema'
 import type { Value } from '../QueryDescription'
-import { type RawRecord, sanitizedRaw, setRawSanitized } from '../RawRecord'
+import { type RawRecord, type DirtyRaw, sanitizedRaw, setRawSanitized } from '../RawRecord'
 import { setRawColumnChange } from '../sync/helpers'
 
-import { createTimestampsFor, hasUpdatedAt } from './helpers'
+import { createTimestampsFor, hasUpdatedAt, fetchChildren } from './helpers'
 
 export type RecordId = string
 
@@ -37,15 +33,9 @@ export function associations(
   return (fromPairs(associationList): any)
 }
 
-let experimentalOnlyMarkAsChangedIfDiffers = false
-
-export function experimentalSetOnlyMarkAsChangedIfDiffers(value: boolean): void {
-  experimentalOnlyMarkAsChangedIfDiffers = value
-}
-
 export default class Model {
   // Set this in concrete Models to the name of the database table
-  static table: TableName<$FlowFixMe<this>>
+  static +table: TableName<this>
 
   // Set this in concrete Models to define relationships between different records
   static associations: Associations = {}
@@ -62,15 +52,25 @@ export default class Model {
   // did not respond yet
   _hasPendingUpdate: boolean = false
 
-  _changes = new BehaviorSubject(this)
+  _hasPendingDelete: false | 'mark' | 'destroy' = false
 
-  @readonly
-  @field('id')
-  id: RecordId
+  __changes: ?BehaviorSubject<$FlowFixMe<this>> = null
 
-  @readonly
-  @field('_status')
-  syncStatus: SyncStatus
+  _getChanges(): BehaviorSubject<$FlowFixMe<this>> {
+    if (!this.__changes) {
+      // initializing lazily - it has non-trivial perf impact on very large collections
+      this.__changes = new BehaviorSubject(this)
+    }
+    return this.__changes
+  }
+
+  get id(): RecordId {
+    return this._raw.id
+  }
+
+  get syncStatus(): SyncStatus {
+    return this._raw._status
+  }
 
   // Modifies the model (using passed function) and saves it to the database.
   // Touches `updatedAt` if available.
@@ -111,16 +111,38 @@ export default class Model {
     // TODO: `process.nextTick` doesn't work on React Native
     // We could polyfill with setImmediate, but it doesn't have the same effect — test and enseure
     // it would actually work for this purpose
-    if (isDevelopment && process && process.nextTick) {
+    if (process.env.NODE_ENV !== 'production' && process && process.nextTick) {
       process.nextTick(() => {
         invariant(
           !this._hasPendingUpdate,
-          `record.prepareUpdate was called on ${this.table}#${
-            this.id
-          } but wasn't sent to batch() synchronously -- this is bad!`,
+          `record.prepareUpdate was called on ${this.table}#${this.id} but wasn't sent to batch() synchronously -- this is bad!`,
         )
       })
     }
+
+    return this
+  }
+
+  prepareMarkAsDeleted(): this {
+    invariant(this._isCommitted, `Cannot mark an uncomitted record as deleted`)
+    invariant(!this._hasPendingUpdate, `Cannot mark an updated record as deleted`)
+
+    this._isEditing = true
+    this._raw._status = 'deleted'
+    this._hasPendingDelete = 'mark'
+    this._isEditing = false
+
+    return this
+  }
+
+  prepareDestroyPermanently(): this {
+    invariant(this._isCommitted, `Cannot mark an uncomitted record as deleted`)
+    invariant(!this._hasPendingUpdate, `Cannot mark an updated record as deleted`)
+
+    this._isEditing = true
+    this._raw._status = 'deleted'
+    this._hasPendingDelete = 'destroy'
+    this._isEditing = false
 
     return this
   }
@@ -131,9 +153,7 @@ export default class Model {
     this.collection.database._ensureInAction(
       `Model.markAsDeleted() can only be called from inside of an Action. See docs for more details.`,
     )
-    invariant(this._isCommitted, `Cannot mark as deleted uncommitted record`)
-    this._raw._status = 'deleted'
-    await this.collection._markAsDeleted(this)
+    await this.collection.database.batch(this.prepareMarkAsDeleted())
   }
 
   // Pernamently removes this record from the database
@@ -142,8 +162,25 @@ export default class Model {
     this.collection.database._ensureInAction(
       `Model.destroyPermanently() can only be called from inside of an Action. See docs for more details.`,
     )
-    invariant(this._isCommitted, `Cannot destroy uncommitted record`)
-    await this.collection._destroyPermanently(this)
+    await this.collection.database.batch(this.prepareDestroyPermanently())
+  }
+
+  async experimentalMarkAsDeleted(): Promise<void> {
+    this.collection.database._ensureInAction(
+      `Model.experimental_markAsDeleted() can only be called from inside of an Action. See docs for more details.`,
+    )
+    const children = await fetchChildren(this)
+    children.forEach(model => model.prepareMarkAsDeleted())
+    await this.collection.database.batch(...children, this.prepareMarkAsDeleted())
+  }
+
+  async experimentalDestroyPermanently(): Promise<void> {
+    this.collection.database._ensureInAction(
+      `Model.experimental_destroyPermanently() can only be called from inside of an Action. See docs for more details.`,
+    )
+    const children = await fetchChildren(this)
+    children.forEach(model => model.prepareDestroyPermanently())
+    await this.collection.database.batch(...children, this.prepareDestroyPermanently())
   }
 
   // *** Observing changes ***
@@ -152,12 +189,12 @@ export default class Model {
   // Emits `complete` if this record is destroyed
   observe(): Observable<this> {
     invariant(this._isCommitted, `Cannot observe uncommitted record`)
-    return this._changes
+    return this._getChanges()
   }
 
   // *** Implementation details ***
 
-  collection: Collection<$FlowFixMe<this>>
+  +collection: Collection<$FlowFixMe<this>>
 
   // Collections of other Models in the same domain as this record
   get collections(): CollectionMap {
@@ -212,12 +249,21 @@ export default class Model {
     return record
   }
 
+  static _prepareCreateFromDirtyRaw(
+    collection: Collection<$FlowFixMe<this>>,
+    dirtyRaw: DirtyRaw,
+  ): this {
+    const record = new this(collection, sanitizedRaw(dirtyRaw, collection.schema))
+    record._isCommitted = false
+    return record
+  }
+
   _notifyChanged(): void {
-    this._changes.next(this)
+    this._getChanges().next(this)
   }
 
   _notifyDestroyed(): void {
-    this._changes.complete()
+    this._getChanges().complete()
   }
 
   _getRaw(rawFieldName: ColumnName): Value {
@@ -227,18 +273,29 @@ export default class Model {
   _setRaw(rawFieldName: ColumnName, rawValue: Value): void {
     invariant(this._isEditing, 'Not allowed to change record outside of create/update()')
     invariant(
-      !this._changes.isStopped && this._raw._status !== 'deleted',
+      !(this._getChanges(): $FlowFixMe<BehaviorSubject<any>>).isStopped &&
+        this._raw._status !== 'deleted',
       'Not allowed to change deleted records',
     )
 
     const valueBefore = this._raw[(rawFieldName: string)]
     setRawSanitized(this._raw, rawFieldName, rawValue, this.collection.schema.columns[rawFieldName])
 
-    if (
-      !experimentalOnlyMarkAsChangedIfDiffers ||
-      valueBefore !== this._raw[(rawFieldName: string)]
-    ) {
+    if (valueBefore !== this._raw[(rawFieldName: string)]) {
       setRawColumnChange(this._raw, rawFieldName)
     }
+  }
+
+  // Please don't use this unless you really understand how Watermelon Sync works, and thought long and
+  // hard about risks of inconsistency after sync
+  _dangerouslySetRawWithoutMarkingColumnChange(rawFieldName: ColumnName, rawValue: Value): void {
+    invariant(this._isEditing, 'Not allowed to change record outside of create/update()')
+    invariant(
+      !(this._getChanges(): $FlowFixMe<BehaviorSubject<any>>).isStopped &&
+        this._raw._status !== 'deleted',
+      'Not allowed to change deleted records',
+    )
+
+    setRawSanitized(this._raw, rawFieldName, rawValue, this.collection.schema.columns[rawFieldName])
   }
 }

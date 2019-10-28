@@ -12,6 +12,7 @@ import type Database from '../Database'
 import type Model, { RecordId } from '../Model'
 import type { Condition } from '../QueryDescription'
 import { type TableName, type TableSchema } from '../Schema'
+import { type DirtyRaw } from '../RawRecord'
 
 import RecordCache from './RecordCache'
 import { CollectionChangeTypes } from './common'
@@ -29,18 +30,12 @@ export default class Collection<Record: Model> {
   // (Use Query API to observe collection changes)
   changes: Subject<CollectionChangeSet<Record>> = new Subject()
 
-  #cache: RecordCache<Record>
-
-  get _cache(): RecordCache<Record> {
-    invariant(process.env.NODE_ENV === 'test', '_cache can be accessed only in test environment')
-
-    return this.#cache
-  }
+  _cache: RecordCache<Record>
 
   constructor(database: Database, ModelClass: Class<Record>): void {
     this.database = database
     this.modelClass = ModelClass
-    this.#cache = new RecordCache(ModelClass.table, raw => new ModelClass(this, raw))
+    this._cache = new RecordCache(ModelClass.table, raw => new ModelClass(this, raw))
   }
 
   // Finds a record with the given ID
@@ -48,7 +43,7 @@ export default class Collection<Record: Model> {
   async find(id: RecordId): Promise<Record> {
     invariant(id, `Invalid record ID ${this.table}#${id}`)
 
-    const cachedRecord = this.#cache.get(id)
+    const cachedRecord = this._cache.get(id)
     return cachedRecord || this._fetchRecord(id)
   }
 
@@ -86,18 +81,25 @@ export default class Collection<Record: Model> {
     return this.modelClass._prepareCreate(this, recordBuilder)
   }
 
+  // Prepares a new record in this collection based on a raw object
+  // e.g. `{ foo: 'bar' }`. Don't use this unless you know how RawRecords work in WatermelonDB
+  // this is useful as a performance optimization or if you're implementing your own sync mechanism
+  prepareCreateFromDirtyRaw(dirtyRaw: DirtyRaw): Record {
+    return this.modelClass._prepareCreateFromDirtyRaw(this, dirtyRaw)
+  }
+
   // *** Implementation of Query APIs ***
 
   // See: Query.fetch
   async fetchQuery(query: Query<Record>): Promise<Record[]> {
-    const rawRecords = await this.database.adapter.query(query)
+    const rawRecords = await this.database.adapter.query(query.serialize())
 
-    return this.#cache.recordsFromQueryResult(rawRecords)
+    return this._cache.recordsFromQueryResult(rawRecords)
   }
 
   // See: Query.fetchCount
   fetchCount(query: Query<Record>): Promise<number> {
-    return this.database.adapter.count(query)
+    return this.database.adapter.count(query.serialize())
   }
 
   // *** Implementation details ***
@@ -114,24 +116,16 @@ export default class Collection<Record: Model> {
   async _fetchRecord(id: RecordId): Promise<Record> {
     const raw = await this.database.adapter.find(this.table, id)
     invariant(raw, `Record ${this.table}#${id} not found`)
-    return this.#cache.recordFromQueryResult(raw)
-  }
-
-  async _markAsDeleted(record: Record): Promise<void> {
-    await this.database.adapter.batch([['markAsDeleted', record]])
-    this._onRecordDestroyed(record)
-  }
-
-  async _destroyPermanently(record: Record): Promise<void> {
-    await this.database.adapter.batch([['destroyPermanently', record]])
-    this._onRecordDestroyed(record)
+    return this._cache.recordFromQueryResult(raw)
   }
 
   changeSet(operations: CollectionChangeSet<Record>): void {
     operations.forEach(({ record, type }) => {
       if (type === CollectionChangeTypes.created) {
         record._isCommitted = true
-        this.#cache.add(record)
+        this._cache.add(record)
+      } else if (type === CollectionChangeTypes.destroyed) {
+        this._cache.delete(record)
       }
     })
 
@@ -140,18 +134,14 @@ export default class Collection<Record: Model> {
     operations.forEach(({ record, type }) => {
       if (type === CollectionChangeTypes.updated) {
         record._notifyChanged()
+      } else if (type === CollectionChangeTypes.destroyed) {
+        record._notifyDestroyed()
       }
     })
   }
 
-  _onRecordDestroyed(record: Record): void {
-    this.#cache.delete(record)
-    this.changes.next([{ record, type: CollectionChangeTypes.destroyed }])
-    record._notifyDestroyed()
-  }
-
   // See: Database.unsafeClearCaches
   unsafeClearCache(): void {
-    this.#cache.unsafeClear()
+    this._cache.unsafeClear()
   }
 }

@@ -1,8 +1,8 @@
 // @flow
 
-import { devMeasureTimeAsync, logger, isDevelopment, invariant } from '../utils/common'
-import type Model, { RecordId } from '../Model'
-import type Query from '../Query'
+import { devMeasureTimeAsync, logger, invariant } from '../utils/common'
+import type { RecordId } from '../Model'
+import type { SerializedQuery } from '../Query'
 import type { TableSchema } from '../Schema'
 import type { BatchOperation, CachedQueryResult, CachedFindResult, DatabaseAdapter } from './type'
 import { sanitizedRaw, type DirtyRaw } from '../RawRecord'
@@ -11,7 +11,7 @@ export type DirtyFindResult = RecordId | ?DirtyRaw
 export type DirtyQueryResult = Array<RecordId | DirtyRaw>
 
 export function validateAdapter(adapter: DatabaseAdapter): void {
-  if (isDevelopment) {
+  if (process.env.NODE_ENV !== 'production') {
     const { schema, migrations } = adapter
     // TODO: uncomment when full migrations are shipped
     // invariant(migrations, `Missing migrations`)
@@ -25,16 +25,12 @@ export function validateAdapter(adapter: DatabaseAdapter): void {
 
       invariant(
         maxVersion <= schema.version,
-        `Migrations can't be newer than schema. Schema is version ${
-          schema.version
-        } and migrations cover range from ${minVersion} to ${maxVersion}`,
+        `Migrations can't be newer than schema. Schema is version ${schema.version} and migrations cover range from ${minVersion} to ${maxVersion}`,
       )
 
       invariant(
         maxVersion === schema.version,
-        `Missing migration. Database schema is currently at version ${
-          schema.version
-        }, but migrations only cover range from ${minVersion} to ${maxVersion}`,
+        `Missing migration. Database schema is currently at version ${schema.version}, but migrations only cover range from ${minVersion} to ${maxVersion}`,
       )
     }
   }
@@ -44,18 +40,17 @@ export function sanitizeFindResult(
   dirtyRecord: DirtyFindResult,
   tableSchema: TableSchema,
 ): CachedFindResult {
-  return dirtyRecord && typeof dirtyRecord === 'object' ?
-    sanitizedRaw(dirtyRecord, tableSchema) :
-    dirtyRecord
+  return dirtyRecord && typeof dirtyRecord === 'object'
+    ? sanitizedRaw(dirtyRecord, tableSchema)
+    : dirtyRecord
 }
 
 export function sanitizeQueryResult(
   dirtyRecords: DirtyQueryResult,
   tableSchema: TableSchema,
 ): CachedQueryResult {
-  return dirtyRecords.map(
-    dirtyRecord =>
-      typeof dirtyRecord === 'string' ? dirtyRecord : sanitizedRaw(dirtyRecord, tableSchema),
+  return dirtyRecords.map(dirtyRecord =>
+    typeof dirtyRecord === 'string' ? dirtyRecord : sanitizedRaw(dirtyRecord, tableSchema),
   )
 }
 
@@ -78,18 +73,18 @@ export async function devLogFind(
   return data
 }
 
-export async function devLogQuery<T: Model>(
+export async function devLogQuery(
   executeBlock: () => Promise<CachedQueryResult>,
-  query: Query<T>,
+  query: SerializedQuery,
 ): Promise<CachedQueryResult> {
   const [dirtyRecords, time] = await devMeasureTimeAsync(executeBlock)
   logger.log(`[DB] Loaded ${dirtyRecords.length} ${query.table} in ${time}ms`)
   return dirtyRecords
 }
 
-export async function devLogCount<T: Model>(
+export async function devLogCount(
   executeBlock: () => Promise<number>,
-  query: Query<T>,
+  query: SerializedQuery,
 ): Promise<number> {
   const [count, time] = await devMeasureTimeAsync(executeBlock)
   logger.log(`[DB] Counted ${count} ${query.table} in ${time}ms`)
@@ -104,10 +99,8 @@ export async function devLogBatch<T>(
     return
   }
   const [, time] = await devMeasureTimeAsync(executeBlock)
-  const [type, { table }] = operations[0]
+  const [type, table] = operations[0]
   logger.log(
-    `[DB] Executed batch of ${
-      operations.length
-    } operations (first: ${type} on ${table}) in ${time}ms`,
+    `[DB] Executed batch of ${operations.length} operations (first: ${type} on ${table}) in ${time}ms`,
   )
 }

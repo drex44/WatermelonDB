@@ -4,8 +4,131 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Highlights
+
+This is a **massive** new update to WatermelonDB! 🍉
+
+- **Up to 23x faster sync**. You heard that right. We've made big improvements to performance.
+  In our tests, with a massive sync (first login, 45MB of data / 65K records) we got a speed up of:
+  - 5.7s -> 1.2s on web (5x)
+  - 142s -> 6s on iOS (23x)
+  Expect more improvements in the coming releases!
+- **Improved LokiJS adapter**. Option to disable web workers, important Safari 13 fix, better performance,
+  and now works in Private Modes
+- **Improved TypeScript support** — thanks to the community
+
+### ⚠️ Breaking
+
+- Deprecated `bool` schema column type is removed -- please change to `boolean`
+- Experimental `experimentalSetOnlyMarkAsChangedIfDiffers(false)` API is now removed
+
+### New featuers
+
+- [LokiJS] Introduces new `new LokiJSAdapter({ ..., experimentalUseIncrementalIndexedDB: true })` option.
+  When enabled, database will be saved to browser's IndexedDB using a new adapter that only saves the
+  changed records, instead of the entire database.
+
+  **This works around a serious bug in Safari 13** (https://bugs.webkit.org/show_bug.cgi?id=202137) that causes large
+  databases to quickly balloon to gigabytes of temporary trash
+
+  This also improves performance of incremental saves, although initial page load or very, very large saves
+  might be slightly slower.
+
+  This is intended to become the new default option, but it's not backwards compatible (if enabled, old database
+  will be lost). **You're welcome to contribute an automatic migration code.**
+
+  Note that this option is still experimental, and might change in breaking ways at any time.
+
+- [LokiJS] Introduces new `new LokiJSAdapter({ ..., useWebWorker: false })` option. Before, web workers
+  were always used with `LokiJSAdapter`. Although web workers may have some performance benefits, disabling them
+  may lead to lower memory consumption, lower latency, and easier debugging. YMMV.
+
+- [Model] Add `Model._dangerouslySetRawWithoutMarkingColumnChange()` method. You probably shouldn't use it,
+  but if you know what you're doing and want to live-update records from server without marking record as updated,
+  this is useful
+- [Collection] Add `Collection.prepareCreateFromDirtyRaw()`
+- @json decorator sanitizer functions take an optional second argument, with a reference to the model
+
+### Improvements
+
+- [Performance] Make large batches a lot faster (1.3s shaved off on a 65K insert sample)
+- [Performance] [iOS] Make large batch inserts an order of magnitude faster
+- [Performance] [iOS] Make encoding very large queries (with thousands of parameters) 20x faster
+- [Performance] [LokiJS] Make batch inserts faster (1.5s shaved off on a 65K insert sample)
+- [Performance] [LokiJS] Various performance improvements
+- [Performance] [Sync] Make Sync faster
+- [Performance] Make observation faster
+- Fix app glitches and performance issues caused by race conditions in `Query.observeWithColumns()`
+- [LokiJS] Persistence adapter will now be automatically selected based on availability. By default,
+  IndexedDB is used. But now, if unavailable (e.g. in private mode), ephemeral memory adapter will be used.
+- [adapters] The adapters interface has changed. `query()` and `count()` methods now receive a `SerializedQuery`, and `batch()` now takes `TableName<any>` and `RawRecord` or `RecordId` instead of `Model`.
+- [Typescript] Typing improvements
+     - Added 3 missing properties `collections`, `database` and `asModel` in Model type definition.
+     - Removed optional flag on `actionsEnabled` in the Database constructor options since its mandatory since 0.13.0.
+     - fixed several further typing issues in Model, Relation and lazy decorator
+- Changed how async functions are transpiled in the library. This could break on really old Android phones
+  but shouldn't matter if you use latest version of React Native. Please report an issue if you see a problem.
+- Avoid `database` prop drilling in the web demo
+
+## 0.14.1 - 2019-08-31
+
+Hotfix for rambdax crash
+
+- [Schema] Handle invalid table schema argument in appSchema
+- [withObservables] Added TypeScript support ([changelog](https://github.com/Nozbe/withObservables/blob/master/CHANGELOG.md))
+- [Electron] avoid `Uncaught ReferenceError: global is not defined` in electron runtime ([#453](https://github.com/Nozbe/WatermelonDB/issues/453))
+- [rambdax] Replaces `contains` with `includes` due to `contains` deprecation https://github.com/selfrefactor/rambda/commit/1dc1368f81e9f398664c9d95c2efbc48b5cdff9b#diff-04c6e90faac2675aa89e2176d2eec7d8R2209
+
+## 0.14.0 - 2019-08-02
+
+### New features
+- [Query] Added support for `notLike` queries 🎉
+- [Actions] You can now batch delete record with all descendants using experimental functions `experimentalMarkAsDeleted` or `experimentalDestroyPermanently`
+
+## 0.13.0 - 2019-07-18
+
+### ⚠️ Breaking
+
+- [Database] It is now mandatory to pass `actionsEnabled:` option to Database constructor.
+     It is recommended that you enable this option:
+
+     ```js
+     const database = new Database({
+       adapter: ...,
+       modelClasses: [...],
+       actionsEnabled: true
+     })
+     ```
+
+     See `docs/Actions.md` for more details about Actions. You can also pass `false` to maintain
+     backward compatibility, but this option **will be removed** in a later version
+- [Adapters] `migrationsExperimental` prop of `SQLiteAdapter` and `LokiJSAdapter` has been renamed
+    to `migrations`.
+
+### New features
+- [Actions] You can now batch deletes by using `prepareMarkAsDeleted` or `prepareDestroyPermanently`
+- [Sync] Performance: `synchronize()` no longer calls your `pushChanges()` function if there are no
+    local changes to push. This is meant to save unnecessary network bandwidth. ⚠️ Note that this
+    could be a breaking change if you rely on it always being called
+- [Sync] When setting new values to fields on a record, the field (and record) will no longer be
+    marked as changed if the field's value is the same. This is meant to improve performance and avoid
+    unnecessary code in the app. ⚠️ Note that this could be a breaking change if you rely on the old
+    behavior. For now you can import `experimentalSetOnlyMarkAsChangedIfDiffers` from
+    `@nozbe/watermelondb/Model/index` and call if with `(false)` to bring the old behavior back, but
+    this will be removed in the later version -- create a new issue explaining why you need this
+- [Sync] Small perf improvements
+
+### Improvements
+- [Typescript] Improved types for SQLite and LokiJS adapters, migrations, models, the database and the logger.
+
+## 0.12.3 - 2019-05-06
+
 ### Changes
-- [Database] You can now update the random id schema by importing `import { setGenerator } from '@nozbe/watermelondb/utils/common/randomId'` and then calling `setGenerator(newGenenerator)`. This allows WatermelonDB to create specific IDs for example if your backend uses UUIDs.
+
+- [Database] You can now update the random id schema by importing
+    `import { setGenerator } from '@nozbe/watermelondb/utils/common/randomId'` and then calling `setGenerator(newGenenerator)`.
+    This allows WatermelonDB to create specific IDs for example if your backend uses UUIDs.
+- [Typescript] Type improvements to SQLiteAdapter and Database
 - [Tests] remove cleanup for react-hooks-testing-library@0.5.0 compatibility
 
 ## 0.12.2 - 2019-04-19

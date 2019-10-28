@@ -99,7 +99,7 @@ describe('fetching queries', () => {
 
     // check if query was passed correctly
     expect(adapter.query.mock.calls.length).toBe(1)
-    expect(adapter.query.mock.calls[0][0]).toBe(query)
+    expect(adapter.query.mock.calls[0][0]).toEqual(query.serialize())
   })
   it('fetches query records from cache if possible', async () => {
     const { tasks: collection, adapter } = mockDatabase()
@@ -151,8 +151,8 @@ describe('fetching queries', () => {
     expect(await collection.fetchCount(query)).toBe(10)
 
     expect(adapter.count.mock.calls.length).toBe(2)
-    expect(adapter.count.mock.calls[0][0]).toBe(query)
-    expect(adapter.count.mock.calls[1][0]).toBe(query)
+    expect(adapter.count.mock.calls[0][0]).toEqual(query.serialize())
+    expect(adapter.count.mock.calls[1][0]).toEqual(query.serialize())
   })
 })
 
@@ -173,7 +173,7 @@ describe('creating new records', () => {
     expect(m1._isCommitted).toBe(true)
     expect(newModelSpy).toHaveBeenCalledTimes(1)
     expect(dbBatchSpy).toHaveBeenCalledTimes(1)
-    expect(dbBatchSpy).toHaveBeenCalledWith([['create', m1]])
+    expect(dbBatchSpy).toHaveBeenCalledWith([['create', 'mock_tasks', m1._raw]])
     expect(observer).toHaveBeenCalledTimes(1)
     expect(observer).toHaveBeenCalledWith([{ record: m1, type: CollectionChangeTypes.created }])
     expect(collection._cache.get(m1.id)).toBe(m1)
@@ -195,6 +195,15 @@ describe('creating new records', () => {
     expect(observer).toHaveBeenCalledTimes(0)
     await expect(collection.find(m1.id)).rejects.toBeInstanceOf(Error)
   })
+  it('can prepare records from raw', async () => {
+    const { tasks: collection } = mockDatabase()
+
+    const newModelSpy = jest.spyOn(MockTask, '_prepareCreateFromDirtyRaw')
+
+    const m1 = collection.prepareCreateFromDirtyRaw({ col3: 'hello' })
+    expect(m1._isCommitted).toBe(false)
+    expect(newModelSpy).toHaveBeenCalledTimes(1)
+  })
   it('disallows record creating outside of an action', async () => {
     const { database, tasks } = mockDatabase({ actionsEnabled: true })
 
@@ -205,25 +214,5 @@ describe('creating new records', () => {
 
     // no throw inside action
     await database.action(() => tasks.create(noop))
-  })
-  it('can destroy records permanently', async () => {
-    // should this even be tested here? Shouldn't it be tested on Model, without mocks?
-    const { tasks: collection, adapter } = mockDatabase()
-    adapter.batch = jest.fn()
-
-    const observer = jest.fn()
-    collection.changes.subscribe(observer)
-
-    const m1 = new MockTask(collection, { id: 'm1' })
-    collection._cache.add(m1)
-
-    await collection._destroyPermanently(m1)
-
-    // Check database delete, cache delete, observers update
-    expect(adapter.batch).toHaveBeenCalledTimes(1)
-    expect(adapter.batch).toHaveBeenCalledWith([['destroyPermanently', m1]])
-    expect(collection._cache.get('m1')).toBe(undefined)
-    expect(observer).toHaveBeenCalledTimes(1)
-    expect(observer).toHaveBeenCalledWith([{ record: m1, type: CollectionChangeTypes.destroyed }])
   })
 })
